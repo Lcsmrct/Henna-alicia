@@ -21,7 +21,7 @@ load_dotenv(ROOT_DIR / '.env')
 PORT = int(os.getenv("PORT", 8001))
 
 # Configuration MongoDB
-mongo_url = os.environ.get('MONGO_URL', 'mongodb+srv://alicia2bbb:F729P3vgqkofeehC@cluster0.tjxk7lx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+mongo_url = os.environ.get('MONGO_URL', 'mongodb+srv://alicia2bbb:LW8g5ucU87qkRY2W@cluster0.tjxk7lx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
 db_name = os.environ.get('DB_NAME', 'Cluster0')
 
 client = AsyncIOMotorClient(mongo_url)
