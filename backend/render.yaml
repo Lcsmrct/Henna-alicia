@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: henna-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: MONGO_URL
+        fromDatabase:
+          name: henna-db
+          property: connectionString
+      - key: DB_NAME
+        value: "Cluster0"
+      - key: INSTAGRAM_APP_ID
+        value: ""
+      - key: INSTAGRAM_APP_SECRET
+        value: ""
+      - key: INSTAGRAM_REDIRECT_URI
+        value: ""
+    healthCheckPath: /api/
+    autoDeploy: true
+    branch: main
+    buildFilter:
+      paths:
+        - backend/**
+      ignoredPaths:
+        - frontend/**
