@@ -1,18 +1,20 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 import uuid
 from datetime import datetime, date, timedelta
 from enum import Enum
 import httpx
-from cryptography.fernet import Fernet
-import base64
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import asyncio
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -99,6 +101,74 @@ class TimeSlotCreate(BaseModel):
     time: str
     is_available: bool = True
 
+# Nouveaux modèles pour les avis clients
+class Review(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    service_type: str
+    rating: int = Field(ge=1, le=5)  # Note de 1 à 5
+    comment: str
+    is_published: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ReviewCreate(BaseModel):
+    client_name: str
+    service_type: str
+    rating: int = Field(ge=1, le=5)
+    comment: str
+
+class ReviewUpdate(BaseModel):
+    is_published: bool
+
+# Modèles pour l'espace client
+class ClientLogin(BaseModel):
+    email: str
+    phone: str
+
+class ClientSession(BaseModel):
+    client_email: str
+    client_phone: str
+    authenticated_at: datetime = Field(default_factory=datetime.utcnow)
+
+# Fonction pour envoyer des emails
+async def send_email(to_email: str, subject: str, body: str, is_html: bool = True):
+    try:
+        smtp_server = os.getenv("SMTP_SERVER")
+        smtp_port = int(os.getenv("SMTP_PORT", 587))
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+        
+        if not all([smtp_server, smtp_email, smtp_password]):
+            logging.warning("Configuration email incomplète - email non envoyé")
+            return False
+            
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = smtp_email
+        msg['To'] = to_email
+        
+        if is_html:
+            msg.attach(MIMEText(body, 'html'))
+        else:
+            msg.attach(MIMEText(body, 'plain'))
+        
+        # Utiliser asyncio pour éviter de bloquer
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _send_email_sync, smtp_server, smtp_port, smtp_email, smtp_password, msg)
+        
+        logging.info(f"Email envoyé avec succès à {to_email}")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Erreur lors de l'envoi de l'email: {str(e)}")
+        return False
+
+def _send_email_sync(smtp_server, smtp_port, smtp_email, smtp_password, msg):
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_email, smtp_password)
+        server.send_message(msg)
+
 @api_router.get("/")
 async def root():
     return {"message": "API du site de henné - Hennaa.lash"}
@@ -126,11 +196,121 @@ async def create_appointment(appointment_data: AppointmentCreate):
         result = await db.appointments.insert_one(appointment_data_for_db)
         
         if result.inserted_id:
+            # Envoyer email de confirmation au client
+            await send_appointment_confirmation_email(appointment)
+            
+            # Envoyer notification à l'admin
+            await send_admin_notification_email(appointment)
+            
             return appointment
         else:
             raise HTTPException(status_code=500, detail="Erreur lors de la création du rendez-vous")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+async def send_appointment_confirmation_email(appointment: Appointment):
+    """Envoie un email de confirmation au client"""
+    services_info = {
+        "simple": "Henné Simple (5€)",
+        "moyen": "Henné Moyen (8€ par main)",
+        "charge": "Henné Chargé (12€ par main)",
+        "mariee": "Henné Mariée (20€ par main)"
+    }
+    
+    service_name = services_info.get(appointment.service_type, appointment.service_type)
+    appointment_date_str = appointment.appointment_date.strftime("%d/%m/%Y")
+    
+    subject = "✨ Confirmation de votre rendez-vous henné - Hennaa.lash"
+    
+    body = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #2c3e50; text-align: center;">✨ Confirmation de rendez-vous</h2>
+            <p>Bonjour {appointment.client_name},</p>
+            <p>Votre rendez-vous a été enregistré avec succès ! Voici les détails :</p>
+            
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h3 style="margin-top: 0; color: #2c3e50;">📅 Détails du rendez-vous</h3>
+                <p><strong>Service :</strong> {service_name}</p>
+                <p><strong>Date :</strong> {appointment_date_str}</p>
+                <p><strong>Heure :</strong> {appointment.appointment_time}</p>
+                <p><strong>Lieu :</strong> {"À domicile" if appointment.location_type == "domicile" else "En atelier"}</p>
+                {f"<p><strong>Adresse :</strong> {appointment.address}</p>" if appointment.address else ""}
+                {f"<p><strong>Notes :</strong> {appointment.additional_notes}</p>" if appointment.additional_notes else ""}
+            </div>
+            
+            <p><strong>Statut :</strong> En attente de confirmation</p>
+            <p>Je vous contacterai prochainement pour confirmer ce rendez-vous.</p>
+            
+            <div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                <h4 style="margin-top: 0; color: #27ae60;">📞 Besoin de me contacter ?</h4>
+                <p>Instagram : <a href="https://instagram.com/hennaa.lash" style="color: #e1306c;">@hennaa.lash</a></p>
+            </div>
+            
+            <p>Merci de votre confiance !</p>
+            <p style="font-weight: bold;">Hennaa.lash ✨<br>
+            <small>Artiste Henné - Secteur 27/28</small></p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    await send_email(appointment.client_email, subject, body, True)
+
+async def send_admin_notification_email(appointment: Appointment):
+    """Envoie une notification à l'admin"""
+    admin_email = os.getenv("ADMIN_EMAIL")
+    if not admin_email:
+        return
+        
+    services_info = {
+        "simple": "Henné Simple (5€)",
+        "moyen": "Henné Moyen (8€ par main)",
+        "charge": "Henné Chargé (12€ par main)",
+        "mariee": "Henné Mariée (20€ par main)"
+    }
+    
+    service_name = services_info.get(appointment.service_type, appointment.service_type)
+    appointment_date_str = appointment.appointment_date.strftime("%d/%m/%Y")
+    
+    subject = f"🔔 Nouveau rendez-vous - {appointment.client_name}"
+    
+    body = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #2c3e50; text-align: center;">🔔 Nouveau rendez-vous</h2>
+            
+            <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h3 style="margin-top: 0; color: #2c3e50;">👤 Informations client</h3>
+                <p><strong>Nom :</strong> {appointment.client_name}</p>
+                <p><strong>Email :</strong> {appointment.client_email}</p>
+                <p><strong>Téléphone :</strong> {appointment.client_phone}</p>
+                {f"<p><strong>Instagram :</strong> @{appointment.client_instagram}</p>" if appointment.client_instagram else ""}
+            </div>
+            
+            <div style="background: #fff3cd; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h3 style="margin-top: 0; color: #856404;">📅 Détails du rendez-vous</h3>
+                <p><strong>Service :</strong> {service_name}</p>
+                <p><strong>Date :</strong> {appointment_date_str}</p>
+                <p><strong>Heure :</strong> {appointment.appointment_time}</p>
+                <p><strong>Lieu :</strong> {"À domicile" if appointment.location_type == "domicile" else "En atelier"}</p>
+                {f"<p><strong>Adresse :</strong> {appointment.address}</p>" if appointment.address else ""}
+                {f"<p><strong>Notes :</strong> {appointment.additional_notes}</p>" if appointment.additional_notes else ""}
+            </div>
+            
+            <p style="text-align: center;">
+                <strong>⚠️ N'oubliez pas de confirmer ce rendez-vous via votre interface admin !</strong>
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    await send_email(admin_email, subject, body, True)
 
 @api_router.get("/appointments", response_model=List[Appointment])
 async def get_appointments():
@@ -175,9 +355,175 @@ async def update_appointment_status(appointment_id: str, status: str):
             {"$set": {"status": status}}
         )
         if result.matched_count:
+            # Envoyer email de mise à jour du statut au client
+            appointment = await db.appointments.find_one({"id": appointment_id})
+            if appointment and status in ["confirmed", "cancelled"]:
+                await send_status_update_email(appointment, status)
+            
             return {"message": "Statut mis à jour avec succès", "status": status}
         else:
             raise HTTPException(status_code=404, detail="Rendez-vous non trouvé")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+async def send_status_update_email(appointment_data: dict, new_status: str):
+    """Envoie un email de mise à jour du statut au client"""
+    appointment_date_str = appointment_data['appointment_date']
+    if isinstance(appointment_date_str, str):
+        appointment_date_str = datetime.fromisoformat(appointment_date_str).strftime("%d/%m/%Y")
+    
+    if new_status == "confirmed":
+        subject = "✅ Votre rendez-vous henné est confirmé !"
+        status_message = "confirmé"
+        status_color = "#27ae60"
+        additional_info = """
+        <div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h4 style="margin-top: 0; color: #27ae60;">✅ Rendez-vous confirmé</h4>
+            <p>Votre rendez-vous est confirmé ! Je vous attends avec plaisir.</p>
+            <p><strong>Rappel :</strong> Prévoyez environ 30 minutes avant le rendez-vous pour que le henné sèche correctement.</p>
+        </div>
+        """
+    else:  # cancelled
+        subject = "❌ Annulation de votre rendez-vous henné"
+        status_message = "annulé"
+        status_color = "#e74c3c"
+        additional_info = """
+        <div style="background: #fdeaea; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h4 style="margin-top: 0; color: #e74c3c;">❌ Rendez-vous annulé</h4>
+            <p>Votre rendez-vous a été annulé. N'hésitez pas à reprendre contact pour reprogrammer.</p>
+        </div>
+        """
+    
+    body = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: {status_color}; text-align: center;">Mise à jour de votre rendez-vous</h2>
+            <p>Bonjour {appointment_data['client_name']},</p>
+            <p>Votre rendez-vous du <strong>{appointment_date_str} à {appointment_data['appointment_time']}</strong> a été <strong style="color: {status_color};">{status_message}</strong>.</p>
+            
+            {additional_info}
+            
+            <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                <h4 style="margin-top: 0; color: #2c3e50;">📞 Questions ?</h4>
+                <p>Instagram : <a href="https://instagram.com/hennaa.lash" style="color: #e1306c;">@hennaa.lash</a></p>
+            </div>
+            
+            <p>Merci !</p>
+            <p style="font-weight: bold;">Hennaa.lash ✨<br>
+            <small>Artiste Henné - Secteur 27/28</small></p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    await send_email(appointment_data['client_email'], subject, body, True)
+
+# Routes pour les avis clients
+@api_router.get("/reviews", response_model=List[Review])
+async def get_reviews(published_only: bool = True):
+    try:
+        filter_criteria = {"is_published": True} if published_only else {}
+        reviews = await db.reviews.find(filter_criteria).sort("created_at", -1).to_list(1000)
+        
+        for review in reviews:
+            if isinstance(review['created_at'], str):
+                review['created_at'] = datetime.fromisoformat(review['created_at'])
+        
+        return [Review(**review) for review in reviews]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+@api_router.post("/reviews", response_model=Review)
+async def create_review(review_data: ReviewCreate):
+    try:
+        review_dict = review_data.dict()
+        review = Review(**review_dict)
+        
+        review_data_for_db = review.dict()
+        review_data_for_db['created_at'] = review_data_for_db['created_at'].isoformat()
+        
+        result = await db.reviews.insert_one(review_data_for_db)
+        
+        if result.inserted_id:
+            return review
+        else:
+            raise HTTPException(status_code=500, detail="Erreur lors de la création de l'avis")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+@api_router.put("/reviews/{review_id}")
+async def update_review_status(review_id: str, review_update: ReviewUpdate):
+    try:
+        result = await db.reviews.update_one(
+            {"id": review_id},
+            {"$set": {"is_published": review_update.is_published}}
+        )
+        if result.matched_count:
+            return {"message": "Avis mis à jour avec succès"}
+        else:
+            raise HTTPException(status_code=404, detail="Avis non trouvé")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+@api_router.delete("/reviews/{review_id}")
+async def delete_review(review_id: str):
+    try:
+        result = await db.reviews.delete_one({"id": review_id})
+        if result.deleted_count:
+            return {"message": "Avis supprimé avec succès"}
+        else:
+            raise HTTPException(status_code=404, detail="Avis non trouvé")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+# Routes pour l'espace client
+@api_router.post("/client/login")
+async def client_login(login_data: ClientLogin):
+    try:
+        # Vérifier si le client a des rendez-vous avec cet email et téléphone
+        appointments = await db.appointments.find({
+            "client_email": login_data.email,
+            "client_phone": login_data.phone
+        }).to_list(100)
+        
+        if not appointments:
+            raise HTTPException(status_code=404, detail="Aucun rendez-vous trouvé avec ces informations")
+        
+        # Créer une session simple (optionnel - peut être géré côté frontend)
+        session = ClientSession(
+            client_email=login_data.email,
+            client_phone=login_data.phone
+        )
+        
+        return {
+            "message": "Connexion réussie",
+            "client_name": appointments[0].get('client_name', ''),
+            "total_appointments": len(appointments)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
+
+@api_router.get("/client/appointments")
+async def get_client_appointments(email: str, phone: str):
+    try:
+        appointments = await db.appointments.find({
+            "client_email": email,
+            "client_phone": phone
+        }).sort("appointment_date", -1).to_list(100)
+        
+        for appointment in appointments:
+            if isinstance(appointment['appointment_date'], str):
+                appointment['appointment_date'] = datetime.fromisoformat(appointment['appointment_date']).date()
+            if isinstance(appointment['created_at'], str):
+                appointment['created_at'] = datetime.fromisoformat(appointment['created_at'])
+                
+        return [Appointment(**appointment) for appointment in appointments]
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
@@ -286,7 +632,7 @@ async def update_time_slot_availability(slot_id: str, is_available: bool):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur: {str(e)}")
 
-# Instagram Models
+# Instagram Models et routes (conservation de l'existant)
 class InstagramToken(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str = "henna_artist"
